@@ -101,4 +101,43 @@ r = agent._enforce({"tool_call": {"name": "compute_amount", "arguments": {}}}, [
 t("missing required arg blocked", "content" in r)
 
 
+# --- hardening: word-boundary marker matching (no false yes / change) ------
+t("yesterday is NOT a confirmation",
+  agent._confirmation_present([
+      {"role": "assistant", "content": "I propose to change RS-1 to B."},
+      {"role": "user", "content": "I will call you yesterday evening."},
+  ]) is False)
+t("exchange is NOT a proposal",
+  agent._confirmation_present([
+      {"role": "assistant", "content": "We can exchange the cable if you like."},
+      {"role": "user", "content": "yes proceed"},
+  ]) is False)
+
+
+# --- hardening: no stale / duplicate write --------------------------------
+changed = {"reservation_id": "RS-1", "status": "awaiting_collection_changed", "assets": [{"asset_id": "EQ-NEW"}]}
+read_again = {"reservation_id": "RS-1", "status": "awaiting_collection", "assets": [{"asset_id": "EQ-OLD"}]}
+msgs_stale = [{"role": "tool", "content": json.dumps(changed)},
+              {"role": "tool", "content": json.dumps(read_again)},
+              {"role": "user", "content": "yes proceed"}]
+r = agent._enforce({"tool_call": {"name": "change_reserved_asset",
+                                  "arguments": {"reservation_id": "RS-1", "old_asset_id": "EQ-OLD",
+                                                "new_asset_id": "EQ-NEW", "credit_id": "CR-1"}}},
+                   msgs_stale, [])
+t("stale/duplicate write blocked",
+  "content" in r and "already been changed" in r.get("content", ""))
+
+
+# --- hardening: credit must belong to verified member ----------------------
+profile = {"member_id": "MB-X", "credits": {"CR-OK": {"credit_id": "CR-OK", "balance": 50}}}
+msgs_cred = [{"role": "tool", "content": json.dumps(profile)},
+             {"role": "tool", "content": json.dumps(await_res)},
+             {"role": "user", "content": "yes proceed"}]
+r = agent._enforce({"tool_call": {"name": "change_reserved_asset",
+                                  "arguments": {"reservation_id": "RS-1", "old_asset_id": "EQ-OLD",
+                                                "new_asset_id": "EQ-NEW", "credit_id": "CR-WRONG"}}},
+                   msgs_cred, [])
+t("wrong credit blocked", "content" in r and "does not belong" in r.get("content", ""))
+
+
 print("\nRESULT:", "ALL PASS" if not FAILED else "SOME FAILED")

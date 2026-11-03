@@ -27,6 +27,7 @@ IMPORTANT DESIGN NOTES (read before editing):
 from __future__ import annotations
 
 import json
+import re
 
 from interview_sdk import chat
 
@@ -42,13 +43,11 @@ PRIVATE_READ_TOOLS = {
 
 # Words that mark an assistant message as a *change proposal* (used to decide
 # whether a later customer confirmation is "fresh"). Deliberately action-oriented
-# so that a neutral status note ("Applying the confirmed plan to RS-..") is NOT
-# mistaken for a new proposal (which would otherwise invalidate the confirmation).
-# Words that mark an assistant message as a *change proposal* (used to decide
-# whether a later customer confirmation is "fresh"). Deliberately action-oriented
 # and avoiding generic verbs like "update"/"modify"/"switch" so that a neutral
 # batch-execution status line ("Applying the confirmed plan to RS-..") is NOT
 # mistaken for a new proposal (which would otherwise invalidate the confirmation).
+# Matching uses word boundaries so that e.g. "exchange" does not count as a
+# "change" proposal and "yesterday" does not count as a "yes" confirmation.
 PROPOSAL_MARKERS = (
     "propose", "change", "replace", "swap", "cancel",
     "am changing", "will change",
@@ -58,6 +57,13 @@ CONFIRM_MARKERS = (
     "confirm", "i confirm", "yes", "proceed", "go ahead", "approve",
     "approved", "do it", "please proceed", "looks good", "correct",
     "that's right", "go for it", "make the change",
+)
+
+_PROPOSAL_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(m) for m in PROPOSAL_MARKERS) + r")(?!\w)"
+)
+_CONFIRM_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(m) for m in CONFIRM_MARKERS) + r")(?!\w)"
 )
 
 
@@ -138,10 +144,17 @@ def _tool_required(tools) -> dict:
     return req
 
 
+_WRITE_PREFIXES = (
+    "change", "update", "cancel", "create", "delete", "modify", "remove", "add",
+    "set", "replace", "swap", "move", "transfer", "assign", "edit", "alter",
+    "revise", "adjust",
+)
+
+
 def _is_write(name: str) -> bool:
     if name in WRITE_TOOLS:
         return True
-    return name.startswith(("change", "update", "cancel", "create", "delete", "modify", "remove", "add", "set"))
+    return name.startswith(_WRITE_PREFIXES)
 
 
 def _is_private_read(name: str) -> bool:
@@ -186,10 +199,10 @@ def _confirmation_present(messages) -> bool:
         role = m.get("role")
         text = (m.get("content") or "").casefold()
         if role == "assistant":
-            if any(mark in text for mark in PROPOSAL_MARKERS):
+            if _PROPOSAL_RE.search(text):
                 last_proposal_idx = i
         elif role == "user":
-            if any(mark in text for mark in CONFIRM_MARKERS):
+            if _CONFIRM_RE.search(text):
                 last_confirm_idx = i
     if last_proposal_idx < 0:
         return False
@@ -214,6 +227,55 @@ def _find_reservation(messages, reservation_id):
         if isinstance(data, dict) and data.get("reservation_id") == reservation_id:
             found = data
     return found
+
+
+def _parse_tool(m):
+    raw = m.get("content", "")
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _reservation_already_changed(messages, reservation_id):
+    """True if a successful change result for this reservation already exists in
+    the transcript. Prevents stale / duplicate writes (the harness imposes a
+    severe penalty for unexpected or stale write actions).
+    """
+    if not reservation_id:
+        return False
+    for m in messages:
+        if m.get("role") != "tool":
+            continue
+        data = _parse_tool(m)
+        if not isinstance(data, dict):
+            continue
+        if data.get("reservation_id") != reservation_id or "error" in data:
+            continue
+        status = data.get("status")
+        if status is not None and status != "awaiting_collection":
+            return True
+    return False
+
+
+def _member_credit_ids(messages):
+    """Return the set of credit ids belonging to the verified member, or None if
+    the profile has not been read / cannot be parsed. Callers must NOT block when
+    this returns None (unknown structure -> fail open, not closed).
+    """
+    for m in messages:
+        if m.get("role") != "tool":
+            continue
+        data = _parse_tool(m)
+        if not isinstance(data, dict) or "credits" not in data:
+            continue
+        credits = data["credits"]
+        if isinstance(credits, dict):
+            return set(credits.keys())
+        if isinstance(credits, list):
+            return {c.get("credit_id") for c in credits if isinstance(c, dict)}
+        return None
+    return None
 
 
 def _enforce(result: dict, messages: list, tools: list) -> dict:
@@ -268,6 +330,27 @@ def _enforce(result: dict, messages: list, tools: list) -> dict:
                         f"currently on reservation {reservation_id}. I can only "
                         "replace the asset that is actually reserved, so I won't "
                         "proceed with this change."
+                    )
+                }
+
+            # --- Guardrail: funding source must belong to the verified member ---
+            credit_ids = _member_credit_ids(messages)
+            if credit_ids is not None and arguments.get("credit_id") not in credit_ids:
+                return {
+                    "content": (
+                        f"Credit {arguments.get('credit_id')} does not belong to "
+                        "your verified account, so I can't use it. Please confirm "
+                        "which of your own credits should fund this change."
+                    )
+                }
+
+            # --- Guardrail: no stale / duplicate write ---
+            if _reservation_already_changed(messages, reservation_id):
+                return {
+                    "content": (
+                        f"Reservation {reservation_id} has already been changed and "
+                        "is no longer in 'awaiting_collection'. Under policy I can't "
+                        "change it again. Let me know if you need a different action."
                     )
                 }
 
