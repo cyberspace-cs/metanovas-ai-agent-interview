@@ -41,7 +41,7 @@ def respond(messages: list, tools: list, policy: str) -> dict:
 | `agent.py` | **MVP / 正式提交物**：提示词层 + 确定性安全护栏 |
 | `test_agent_logic.py` | 离线单元测试（**28 项全过**），纯逻辑、无需联网 |
 | `mock_runner.py` | 离线端到端模拟器（确定性假模型，免 API key） |
-| `mock_scenarios.py` | 离线场景验证：批量改单 + 客户改主意（规则7） |
+| `mock_scenarios.py` | 离线场景验证（8 个）：批量 / 改主意 / 混合批量 / 不可用最优 / 无合格项 / 鉴权 / 非可改 / 余额不足 |
 | `practice_runner.py` | 真实 LLM 练习 runner（需自备有余额的 key） |
 | `interview_sdk.py` | 模型调用 SDK（`from interview_sdk import chat`） |
 | `practice_policy.md` / `practice_task.json` / `practice_fixture.json` | 练习套件（平台自带，考试时不传） |
@@ -69,11 +69,11 @@ python mock_runner.py
 > 本机若未把 Python 加到 PATH，可用已安装的解释器：
 > `C:\Users\22521\.workbuddy-cn-backup-20261024-200105\binaries\python\versions\3.13.12\python.exe`
 
-### 2b. 场景验证：批量改单 / 客户改主意（规则7）
+### 2b. 场景验证：8 个策略场景
 ```bash
 python mock_scenarios.py
 ```
-演示：一次计划确认后逐单执行两笔写；客户确认后改主意→旧确认失效、过期写被拦、重新提案再确认。
+覆盖：A 批量（一次确认→逐单写）、B 改主意（旧确认失效→过期写被拦→重提案再确认）、C 混合批量（一单可改/一单已取件）、D 不可用选项（选真正最优）、E 无合格项（拒绝不写）、F 未鉴权拦截、G 非可改状态拒绝、H 余额不足（不执行）。
 
 ### 3. 真实模型练习（需自备有余额的 key）
 ```bash
