@@ -67,8 +67,9 @@ REPORT_MARKERS = (
 GUARDRAIL_MARKERS = (
     "i can't make this change yet", "i cannot make this change yet",
     "before i can access private records", "i need to verify",
-    "i need to read", "i haven't read these yet", "i still need:",
-    "does not belong to your verified account", "i didn't catch that",
+    "i need to read", "i need to re-check", "i haven't read these yet",
+    "i still need:", "does not belong to your verified account",
+    "i didn't catch that",
 )
 CONFIRM_MARKERS = (
     "confirm", "confirmed", "confirmation", "i confirm", "yes", "yes please",
@@ -90,6 +91,15 @@ NEGATION_MARKERS = (
     "do not", "don't", "dont", "not yet", "no,", "no.", "wait", "stop",
     "hold on", "cancel",
 )
+QUESTION_STARTERS = (
+    "what", "why", "how", "when", "where", "who", "which", "can", "could",
+    "would", "should", "is", "are", "shall", "may",
+)
+ACTION_VERBS = (
+    "change", "replace", "swap", "update", "modify", "remove", "add", "set",
+    "switch", "use", "keep", "leave", "skip", "drop", "exclude", "include",
+    "choose", "select", "pick", "revert", "want", "need",
+)
 
 
 def _marker_regex(markers):
@@ -106,6 +116,10 @@ _GUARDRAIL_RE = _marker_regex(GUARDRAIL_MARKERS)
 _CONFIRM_RE = _marker_regex(CONFIRM_MARKERS)
 _REVISION_RE = _marker_regex(REVISION_MARKERS)
 _NEGATION_RE = _marker_regex(NEGATION_MARKERS)
+_QUESTION_RE = re.compile(
+    r"\?|^\s*(?:" + "|".join(QUESTION_STARTERS) + r")\b"
+)
+_ACTION_RE = _marker_regex(ACTION_VERBS)
 
 
 def _is_proposal_text(text: str) -> bool:
@@ -162,6 +176,18 @@ def _build_system_prompt(policy: str, messages=None, tools=None) -> dict:
         "- If a changed plan needs confirmation, present it and ask clearly.\n"
         "- If the current plan is confirmed, call the next pending write immediately.\n"
         "- If every subtask is resolved, return the final report; do not make more calls.\n\n"
+        "TASK ARCHETYPES (handle explicitly):\n"
+        "- Coupled variant resolution: constraints interact; test every candidate "
+        "against ALL constraints together (availability, family, specifications, "
+        "fee/budget, funding) and pick the true optimum among candidates satisfying "
+        "all; state why each rejected candidate fails.\n"
+        "- Conditional action matrix: decide per record BEFORE any write; give an "
+        "explicit no-action with the failing condition for ineligible records; one "
+        "matrix-style plan; execute every eligible write after confirmation.\n"
+        "- Batch replan under revision: on a mid-execution revision, stop pending "
+        "writes, keep completed ones as done, recompute only affected records, "
+        "present the revised remaining plan, obtain fresh confirmation for changed "
+        "actions, then finish every remaining subtask.\n\n"
         "FINAL CUSTOMER OUTPUT must reconcile EVERY requested record: requested condition, "
         "verified status/evidence, action or reason for no-action, selected option, exact fee "
         "impact and funding, and actual write outcome (success or error). Clearly distinguish "
@@ -187,6 +213,17 @@ def _tool_required(tools) -> dict:
         params = fn.get("parameters", {}) or {}
         req[name] = set(params.get("required", []) or [])
     return req
+
+
+def _tool_params(tools) -> dict:
+    """Map tool name -> JSON-schema parameters, for exact-argument filtering."""
+    out: dict[str, dict] = {}
+    for t in (tools or []):
+        fn = t.get("function", t)
+        name = fn.get("name")
+        if name:
+            out[name] = fn.get("parameters", {}) or {}
+    return out
 
 
 _WRITE_PREFIXES = (
@@ -261,36 +298,67 @@ def _is_authenticated(messages) -> bool:
     return False
 
 
-def _confirmation_present(messages) -> bool:
-    """True if a customer confirmation appears AFTER the most recent assistant
-    change proposal. This enforces freshness and specificity: if the agent makes
-    a NEW proposal (e.g. after the customer revises intent) the old confirmation
-    no longer counts and a new one is required.
-    """
-    last_proposal_idx = -1
-    last_confirm_idx = -1
-    last_revision_idx = -1
+def _last_proposal_index(messages) -> int:
+    last = -1
     for i, m in enumerate(messages):
-        role = m.get("role")
-        text = (m.get("content") or "").casefold()
-        if role == "assistant":
-            if _is_proposal_text(text):
-                last_proposal_idx = i
-        elif role == "user":
-            is_confirm = bool(_CONFIRM_RE.search(text)) and not _NEGATION_RE.search(text)
-            is_revision = bool(_REVISION_RE.search(text)) and not is_confirm
-            if is_confirm:
-                last_confirm_idx = i
-            if is_revision:
-                last_revision_idx = i
+        if m.get("role") == "assistant" and _is_proposal_text((m.get("content") or "").casefold()):
+            last = i
+    return last
+
+
+def _classify_user_reply(text: str) -> str:
+    """Classify a customer reply following a proposal: confirm | revision | other.
+
+    Deliberately permissive: an unrecognised-but-short reply after an explicit
+    confirmation request is treated as consent, because a false negative strands
+    the conversation (blocked writes, zero progress) — the failure mode that
+    dominated the first formal attempt. Negations, questions, and new
+    instructions are still excluded.
+    """
+    if _QUESTION_RE.search(text):
+        return "other"
+    if _CONFIRM_RE.search(text):
+        return "confirm"
+    if _REVISION_RE.search(text) or _ACTION_RE.search(text):
+        return "revision"
+    if _NEGATION_RE.search(text):
+        return "revision"
+    if len(text.split()) <= 5:
+        return "confirm"
+    return "other"
+
+
+def _confirmation_present(messages) -> bool:
+    """True if, after the latest proposal, the customer consented and has not
+    since revised the request. Any later revision invalidates the confirmation
+    (rule 7); the agent must then re-propose before writing again.
+    """
+    last_proposal_idx = _last_proposal_index(messages)
     if last_proposal_idx < 0:
         return False
-    # Rule 7: the proposal must be newer than any customer revision, otherwise
-    # the agent must re-propose before a write can be authorised. This covers
-    # both "confirm then revise" and "revise then confirm" orderings.
-    if last_revision_idx > last_proposal_idx:
+    saw_confirm = False
+    for m in messages[last_proposal_idx + 1:]:
+        if m.get("role") != "user":
+            continue
+        kind = _classify_user_reply((m.get("content") or "").casefold())
+        if kind == "revision":
+            return False
+        if kind == "confirm":
+            saw_confirm = True
+    return saw_confirm
+
+
+def _stale_after_revision(messages) -> bool:
+    """True when the customer revised the request after the latest proposal, so
+    a pending write would be stale and the plan must be recalculated first."""
+    last_proposal_idx = _last_proposal_index(messages)
+    if last_proposal_idx < 0:
         return False
-    return last_confirm_idx > last_proposal_idx
+    for m in messages[last_proposal_idx + 1:]:
+        if m.get("role") == "user" and _classify_user_reply(
+                (m.get("content") or "").casefold()) == "revision":
+            return True
+    return False
 
 
 def _find_reservation(messages, reservation_id):
@@ -420,6 +488,11 @@ def _state_digest(messages) -> str:
         f"- Latest customer instruction: {latest_user[:900]}",
         "- Completed tool calls (do not repeat unless revalidation is required):",
     ]
+    if _stale_after_revision(messages):
+        lines.append(
+            "- NOTE: the latest customer instruction revised the previous plan; "
+            "present an updated plan and obtain a fresh confirmation before any write."
+        )
     if not history:
         lines.append("  * none yet")
     for name, args, error in history[-24:]:
@@ -446,6 +519,15 @@ def _normalise_model_result(result):
     if not isinstance(result, dict):
         return result
     content = result.get("content")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            piece = part.get("text") or part.get("content") if isinstance(part, dict) else part
+            if isinstance(piece, str):
+                parts.append(piece)
+        result = dict(result)
+        result["content"] = "\n".join(parts)
+        content = result["content"]
     if result.get("tool_call") or not isinstance(content, str):
         return result
     text = content.strip()
@@ -488,6 +570,14 @@ def _enforce(result: dict, messages: list, tools: list) -> dict:
         arguments = tool_call.get("arguments") or {}
         if not name:
             return {"content": "I need a valid action. Could you clarify your request?"}
+
+        # Exact arguments: when the schema forbids extra properties, drop fields
+        # the model invented so the call matches the declared contract.
+        params = _tool_params(tools).get(name, {})
+        if params.get("additionalProperties") is False:
+            allowed = set((params.get("properties") or {}).keys())
+            if allowed:
+                arguments = {k: v for k, v in arguments.items() if k in allowed}
 
         # --- Guardrail: authentication before private reads ---
         if _is_private_read(name) and not _is_authenticated(messages):
@@ -583,6 +673,14 @@ def _enforce(result: dict, messages: list, tools: list) -> dict:
 
             # --- Guardrail: fresh explicit confirmation before any write ---
             if not _confirmation_present(messages):
+                if _stale_after_revision(messages):
+                    return {
+                        "content": (
+                            "Your latest instruction changes the plan, so I need to "
+                            "re-check the affected records and present an updated plan "
+                            "for your confirmation before making any change."
+                        )
+                    }
                 return {
                     "content": (
                         "I can't make this change yet. To stay within policy I must "
