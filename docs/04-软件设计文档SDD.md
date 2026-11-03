@@ -11,6 +11,7 @@
 | `_is_authenticated` | 从 transcript 判是否已鉴权 | `messages` | bool |
 | `_confirmation_present` | 判"新鲜确认"（提案后才有客户确认） | `messages` | bool |
 | `_find_reservation` | 取某预约的最新已读结果 | `messages, reservation_id` | dict / None |
+| `_id_observed` | 判某 id 是否已在 transcript 中出现（域无关） | `messages, value` | bool |
 | `_enforce` | 确定性护栏 + 合同校验 | `result, messages, tools` | 合规的返回 dict |
 
 ## 2. 护栏算法详述
@@ -21,9 +22,11 @@
 
 ### 2.2 写前状态门（在 `_enforce` 内联）
 对写操作依次校验，任一不满足即改为拒绝文本：
-1. `_find_reservation` 能找到该预约（先读后写）；
-2. `status == "awaiting_collection"`（否则用已验证事实拒绝）；
-3. `old_asset_id` 确实在当前预约 `assets` 中（防错改/跨资产）。
+1. **域无关（始终生效）**：写操作要传的每个 `*_id` 都必须已在 transcript（工具结果或客户消息）中出现过——防止瞎编目标/新旧值/资金源；若目标预约未读，直接要求先读。
+2. **预约域（仅当 transcript 出现 `reservation_id + status + assets` 形态记录时才查）**：
+   - `status == "awaiting_collection"`（否则用已验证事实拒绝）；
+   - `old_asset_id` 确实在当前预约 `assets` 中（防错改/跨资产）。
+3. 其他域字段不同则跳过步骤 2，交由写工具与 policy 自行拒绝，避免误拦。
 
 ### 2.3 确认新鲜度门 `_confirmation_present`
 - 匹配使用**单词边界正则**：助理消息含提案标记（`propose/change/replace/swap/cancel/...`）的最新下标 `P`；用户消息含确认标记（`yes/confirm/proceed/approve/...`）的最新下标 `C`。
@@ -46,6 +49,9 @@
   （fail-open，绝不误拦）。
 - **防重复/过期写**：若 transcript 中已存在该预约的成功改单结果（状态不再是
   `awaiting_collection`），直接拒绝再改，规避"stale/duplicate write"重罚。
+- **规则7 改主意失效**：确认后若客户又说 `instead/actually/rather/never mind/...`
+  （且该句本身不是确认），旧确认立即失效，必须重新提案并重新确认。
+- **域无关 id 观测**：见 §2.2；跨域安全的核心，不依赖具体字段名。
 
 ## 3. 边界情况处理
 
@@ -58,6 +64,8 @@
 | 必填参数缺失 | 拦下，问缺失项 |
 | 模型返回空内容 | 兜底为澄清问句 |
 | 客户改主意 | 新提案使旧确认失效，重算 |
+| 确认后客户又改主意 | 旧确认失效，重新提案+确认（规则7） |
+| 正式域字段与练习不同 | 跳过预约专属校验，仅做域无关校验 |
 | 信用额度不属于本人 | 拦下，请确认自身信用 |
 | 预约已改后再写 | 拦下，说明已改不可再改（防过期/重复写） |
 | 批量 | 列计划→一次确认→逐单写→汇总 |
@@ -65,7 +73,7 @@
 ## 4. 可测试性设计
 - 全部状态解析与护栏为**纯函数**（仅依赖入参 `messages/tools`），可单测。
 - 模型调用收敛到 `chat` 一个入口，可注入 mock 做离线 E2E（`mock_runner.py`）。
-- 已落地单测 `test_agent_logic.py`（19 项全过），覆盖上述边界与新增护栏。
+- 已落地单测 `test_agent_logic.py`（23 项全过），覆盖上述边界与新增护栏。
 
 ## 5. 风险与缓解
 - **确认词匹配**（平台确认话术不含 my 标记词）→ 写被拦。缓解：标记词集合较宽 + 单词边界匹配；若实测卡在"要确认却未改"，放宽 `_confirmation_present` 的确认词。

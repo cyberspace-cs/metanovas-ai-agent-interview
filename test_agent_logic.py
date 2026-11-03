@@ -140,4 +140,51 @@ r = agent._enforce({"tool_call": {"name": "change_reserved_asset",
 t("wrong credit blocked", "content" in r and "does not belong" in r.get("content", ""))
 
 
+# --- hardening: rule 7 — a revision after confirmation drops it ------------
+t("revision after confirm drops confirmation",
+  agent._confirmation_present([
+      {"role": "assistant", "content": "I propose to change RS-1 to B."},
+      {"role": "user", "content": "yes proceed"},
+      {"role": "user", "content": "actually use C instead"},
+  ]) is False)
+t("confirm-including-revision keeps confirmation",
+  agent._confirmation_present([
+      {"role": "assistant", "content": "I propose to change RS-1 to B."},
+      {"role": "user", "content": "actually, go ahead and proceed"},
+  ]) is True)
+
+
+# --- hardening: domain-agnostic 'ids must be observed' ---------------------
+WRITE_SPEC = [{
+    "type": "function",
+    "function": {
+        "name": "change_reserved_asset",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": ["reservation_id", "old_asset_id", "new_asset_id", "credit_id"],
+        },
+    },
+}]
+msgs_unobs = [{"role": "tool", "content": json.dumps(await_res)}, prop, conf]
+r = agent._enforce({"tool_call": {"name": "change_reserved_asset",
+                                  "arguments": {"reservation_id": "RS-1", "old_asset_id": "EQ-OLD",
+                                                "new_asset_id": "EQ-UNSEEN", "credit_id": "CR-1"}}},
+                   msgs_unobs, WRITE_SPEC)
+t("unobserved new id blocked", "content" in r and "haven't read" in r.get("content", ""))
+
+family = {"family_id": "AF-1", "options": {"EQ-OLD": {"available": True}, "EQ-NEW": {"available": True}}}
+profile_ok = {"member_id": "MB-X", "credits": {"CR-1": {"credit_id": "CR-1", "balance": 100}}}
+msgs_full = [{"role": "tool", "content": json.dumps(await_res)},
+             {"role": "tool", "content": json.dumps(family)},
+             {"role": "tool", "content": json.dumps(profile_ok)},
+             prop, conf]
+r = agent._enforce({"tool_call": {"name": "change_reserved_asset",
+                                  "arguments": {"reservation_id": "RS-1", "old_asset_id": "EQ-OLD",
+                                                "new_asset_id": "EQ-NEW", "credit_id": "CR-1"}}},
+                   msgs_full, WRITE_SPEC)
+t("all ids observed -> write allowed",
+  r.get("tool_call", {}).get("name") == "change_reserved_asset")
+
+
 print("\nRESULT:", "ALL PASS" if not FAILED else "SOME FAILED")

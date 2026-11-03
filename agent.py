@@ -66,6 +66,20 @@ _CONFIRM_RE = re.compile(
     r"(?<!\w)(?:" + "|".join(re.escape(m) for m in CONFIRM_MARKERS) + r")(?!\w)"
 )
 
+# A customer revision AFTER a confirmation invalidates it (rule 7: latest
+# instruction is authoritative; stale planned actions must be discarded).
+# Deliberately strong markers so a neutral "continue" is not mistaken for a
+# revision, and a message that is itself a confirmation ("actually, go ahead")
+# is still treated as a confirmation.
+REVISION_MARKERS = (
+    "instead", "actually", "rather", "on second thought", "never mind",
+    "nevermind", "change of plan", "switch to", "different option",
+    "cancel that", "let's change", "lets change", "scratch that",
+)
+_REVISION_RE = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(m) for m in REVISION_MARKERS) + r")(?!\w)"
+)
+
 
 def _build_system_prompt(policy: str) -> dict:
     rules = (
@@ -74,6 +88,11 @@ def _build_system_prompt(policy: str) -> dict:
         "the complete transcript on every turn, so reconstruct the current "
         "intent, what is already done, what is pending, and whether you have a "
         "fresh confirmation purely from the messages.\n\n"
+        "RUNTIME SCHEMAS: the `tools` list and `policy` are authoritative for "
+        "THIS task. Derive the real tool names, required arguments, the target "
+        "record id field, and the mutation tool from them. Do not assume the "
+        "practice task's field names apply here; adapt to the schema you are "
+        "given.\n\n"
         "HARD CONSTRAINTS (violating any fails the task):\n"
         "1. Authenticate the customer with locate_member (full name + six-digit "
         "code) BEFORE any private read (read_member_profile, read_reservation, "
@@ -206,6 +225,15 @@ def _confirmation_present(messages) -> bool:
                 last_confirm_idx = i
     if last_proposal_idx < 0:
         return False
+    # Rule 7: a later customer message that revises intent invalidates the
+    # confirmation, unless that message is itself a confirmation.
+    if last_confirm_idx >= 0:
+        for later in messages[last_confirm_idx + 1:]:
+            if later.get("role") != "user":
+                continue
+            text = (later.get("content") or "").casefold()
+            if _REVISION_RE.search(text) and not _CONFIRM_RE.search(text):
+                return False
     return last_confirm_idx > last_proposal_idx
 
 
@@ -278,6 +306,24 @@ def _member_credit_ids(messages):
     return None
 
 
+def _id_observed(messages, value) -> bool:
+    """True if `value` appears in any prior tool result or customer message.
+
+    Domain-agnostic "read before write / never invent identifiers" check: every
+    id we are about to pass to a write tool must have been observed in the
+    transcript. Works for any tool schema (reservation_id, booking_id, ...).
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    for m in messages:
+        if m.get("role") not in ("tool", "user"):
+            continue
+        raw = m.get("content", "")
+        if isinstance(raw, str) and value in raw:
+            return True
+    return False
+
+
 def _enforce(result: dict, messages: list, tools: list) -> dict:
     """Apply the submission contract and policy guardrails to a raw model answer."""
     if not isinstance(result, dict):
@@ -304,32 +350,72 @@ def _enforce(result: dict, messages: list, tools: list) -> dict:
 
         # --- Guardrail: evidence + state checks before a write ---
         if _is_write(name):
+            required = _tool_required(tools).get(name, set())
             reservation_id = arguments.get("reservation_id")
             reservation = _find_reservation(messages, reservation_id)
-            if reservation is None:
+
+            # Domain-specific checks — applied ONLY when the transcript actually
+            # contains a reservation-like record (the practice schema). On a
+            # different formal schema these are skipped; the tool + policy then
+            # enforce record state, so we never false-block another domain.
+            if isinstance(reservation, dict):
+                status = reservation.get("status")
+                if status is not None and status != "awaiting_collection":
+                    return {
+                        "content": (
+                            f"Reservation {reservation_id or reservation.get('reservation_id')} "
+                            f"is in '{status}' status, not 'awaiting_collection'. Under "
+                            "policy I cannot change it. Let me know if there is another "
+                            "record you'd like to adjust."
+                        )
+                    }
+                current_ids = [
+                    a.get("asset_id")
+                    for a in reservation.get("assets", [])
+                    if isinstance(a, dict)
+                ]
+                if (current_ids and arguments.get("old_asset_id")
+                        and arguments.get("old_asset_id") not in current_ids):
+                    return {
+                        "content": (
+                            f"The asset {arguments.get('old_asset_id')} is not the one "
+                            f"currently on reservation {reservation_id}. I can only "
+                            "replace the asset that is actually reserved, so I won't "
+                            "proceed with this change."
+                        )
+                    }
+                if _reservation_already_changed(messages, reservation.get("reservation_id")):
+                    return {
+                        "content": (
+                            f"Reservation {reservation.get('reservation_id')} has already "
+                            "been changed and is no longer in 'awaiting_collection'. Under "
+                            "policy I can't change it again. Let me know if you need a "
+                            "different action."
+                        )
+                    }
+            elif reservation_id and not _id_observed(messages, reservation_id):
                 return {
                     "content": (
-                        f"I need to verify reservation {reservation_id or '<unknown>'} "
-                        "before changing it. Let me read its current state first."
+                        f"I need to verify record {reservation_id} before changing it. "
+                        "Let me read its current state first."
                     )
                 }
-            if reservation.get("status") != "awaiting_collection":
+
+            # Domain-agnostic: every id we are about to pass must have been
+            # observed in the transcript (tool results or the customer's words).
+            # This blocks inventing records / options / funding on ANY schema.
+            missing_obs = [
+                key for key in required
+                if key.endswith("_id") and isinstance(arguments.get(key), str)
+                and arguments.get(key) and not _id_observed(messages, arguments.get(key))
+            ]
+            if missing_obs:
                 return {
                     "content": (
-                        f"Reservation {reservation_id} is in "
-                        f"'{reservation.get('status')}' status, not "
-                        "'awaiting_collection'. Under policy I cannot change it. "
-                        "Let me know if there is another reservation you'd like to adjust."
-                    )
-                }
-            current_ids = [a.get("asset_id") for a in reservation.get("assets", [])]
-            if arguments.get("old_asset_id") not in current_ids:
-                return {
-                    "content": (
-                        f"The asset {arguments.get('old_asset_id')} is not the one "
-                        f"currently on reservation {reservation_id}. I can only "
-                        "replace the asset that is actually reserved, so I won't "
-                        "proceed with this change."
+                        "Before I change anything I need to verify the current record "
+                        "and the exact identifiers involved. I haven't read these yet: "
+                        f"{', '.join(sorted(missing_obs))}. Let me read the record "
+                        "first, then I can proceed."
                     )
                 }
 
@@ -344,25 +430,14 @@ def _enforce(result: dict, messages: list, tools: list) -> dict:
                     )
                 }
 
-            # --- Guardrail: no stale / duplicate write ---
-            if _reservation_already_changed(messages, reservation_id):
-                return {
-                    "content": (
-                        f"Reservation {reservation_id} has already been changed and "
-                        "is no longer in 'awaiting_collection'. Under policy I can't "
-                        "change it again. Let me know if you need a different action."
-                    )
-                }
-
             # --- Guardrail: fresh explicit confirmation before any write ---
             if not _confirmation_present(messages):
                 return {
                     "content": (
                         "I can't make this change yet. To stay within policy I must "
                         "have your explicit confirmation first. Please confirm the "
-                        "exact change (target reservation, current option, proposed "
-                        "option, fee difference, and funding source) and I will "
-                        "proceed."
+                        "exact change (target record, current option, proposed option, "
+                        "fee difference, and funding source) and I will proceed."
                     )
                 }
 
