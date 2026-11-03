@@ -187,4 +187,69 @@ t("all ids observed -> write allowed",
   r.get("tool_call", {}).get("name") == "change_reserved_asset")
 
 
+# --- rule 7: revision BEFORE confirmation requires re-proposal ------------
+t("revision before confirm requires re-proposal",
+  agent._confirmation_present([
+      {"role": "assistant", "content": "I propose to change RS-1 to B."},
+      {"role": "user", "content": "actually use C instead"},
+      {"role": "user", "content": "yes, go ahead"},
+  ]) is False)
+t("re-proposal after revision allows",
+  agent._confirmation_present([
+      {"role": "assistant", "content": "I propose to change RS-1 to B."},
+      {"role": "user", "content": "actually use C instead"},
+      {"role": "assistant", "content": "I propose to change RS-1 to C."},
+      {"role": "user", "content": "yes, confirm"},
+  ]) is True)
+
+
+# --- domain-agnostic: a DIFFERENT schema write is not false-blocked -------
+DIFF_TOOLS = [{"type": "function", "function": {
+    "name": "change_booking",
+    "parameters": {"type": "object", "properties": {},
+                   "required": ["booking_id", "old_item_id", "new_item_id", "fund_id"]}}}]
+msgs_diff = [
+    {"role": "tool", "content": json.dumps({"booking_id": "BK-1", "status": "confirmed",
+                                            "items": [{"item_id": "IT-1"}]})},
+    {"role": "tool", "content": json.dumps({"item_id": "IT-2", "available": True})},
+    {"role": "tool", "content": json.dumps({"fund_id": "FD-1", "balance": 100})},
+    {"role": "assistant", "content": "I propose to change booking BK-1 from IT-1 to IT-2."},
+    {"role": "user", "content": "yes, proceed"},
+]
+r = agent._enforce({"tool_call": {"name": "change_booking",
+                                  "arguments": {"booking_id": "BK-1", "old_item_id": "IT-1",
+                                                "new_item_id": "IT-2", "fund_id": "FD-1"}}},
+                   msgs_diff, DIFF_TOOLS)
+t("different schema write allowed (no false block)",
+  r.get("tool_call", {}).get("name") == "change_booking")
+
+r = agent._enforce({"tool_call": {"name": "change_booking",
+                                  "arguments": {"booking_id": "BK-9", "old_item_id": "IT-1",
+                                                "new_item_id": "IT-2", "fund_id": "FD-1"}}},
+                   msgs_diff, DIFF_TOOLS)
+t("unobserved target record blocked",
+  "content" in r and "haven't read" in r.get("content", ""))
+
+
+# --- batch: second write allowed after the first write result ------------
+await_res2 = {"reservation_id": "RS-2", "status": "awaiting_collection",
+              "assets": [{"asset_id": "EQ-OLD2"}]}
+changed1 = {"reservation_id": "RS-1", "status": "awaiting_collection_changed",
+            "assets": [{"asset_id": "EQ-NEW"}]}
+family2 = {"family_id": "AF-1", "options": {"EQ-NEW2": {"available": True}}}
+msgs_batch2 = [{"role": "tool", "content": json.dumps(await_res)},
+               {"role": "tool", "content": json.dumps(await_res2)},
+               {"role": "tool", "content": json.dumps(family2)},
+               {"role": "tool", "content": json.dumps(profile_ok)},
+               {"role": "assistant", "content": "I propose a plan for RS-1 and RS-2: change RS-1 and RS-2 to the qualifying option."},
+               {"role": "user", "content": "yes, confirm the plan"},
+               {"role": "tool", "content": json.dumps(changed1)}]
+r = agent._enforce({"tool_call": {"name": "change_reserved_asset",
+                                  "arguments": {"reservation_id": "RS-2", "old_asset_id": "EQ-OLD2",
+                                                "new_asset_id": "EQ-NEW2", "credit_id": "CR-1"}}},
+                   msgs_batch2, WRITE_SPEC)
+t("batch second write allowed after first",
+  r.get("tool_call", {}).get("name") == "change_reserved_asset")
+
+
 print("\nRESULT:", "ALL PASS" if not FAILED else "SOME FAILED")

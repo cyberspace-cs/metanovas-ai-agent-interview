@@ -39,7 +39,7 @@ def respond(messages: list, tools: list, policy: str) -> dict:
 | 文件 | 说明 |
 |---|---|
 | `agent.py` | **MVP / 正式提交物**：提示词层 + 确定性安全护栏 |
-| `test_agent_logic.py` | 离线单元测试（**23 项全过**），纯逻辑、无需联网 |
+| `test_agent_logic.py` | 离线单元测试（**28 项全过**），纯逻辑、无需联网 |
 | `mock_runner.py` | 离线端到端模拟器（确定性假模型，免 API key） |
 | `mock_scenarios.py` | 离线场景验证：批量改单 + 客户改主意（规则7） |
 | `practice_runner.py` | 真实 LLM 练习 runner（需自备有余额的 key） |

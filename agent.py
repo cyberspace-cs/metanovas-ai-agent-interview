@@ -214,6 +214,7 @@ def _confirmation_present(messages) -> bool:
     """
     last_proposal_idx = -1
     last_confirm_idx = -1
+    last_revision_idx = -1
     for i, m in enumerate(messages):
         role = m.get("role")
         text = (m.get("content") or "").casefold()
@@ -221,19 +222,19 @@ def _confirmation_present(messages) -> bool:
             if _PROPOSAL_RE.search(text):
                 last_proposal_idx = i
         elif role == "user":
-            if _CONFIRM_RE.search(text):
+            is_confirm = bool(_CONFIRM_RE.search(text))
+            is_revision = bool(_REVISION_RE.search(text)) and not is_confirm
+            if is_confirm:
                 last_confirm_idx = i
+            if is_revision:
+                last_revision_idx = i
     if last_proposal_idx < 0:
         return False
-    # Rule 7: a later customer message that revises intent invalidates the
-    # confirmation, unless that message is itself a confirmation.
-    if last_confirm_idx >= 0:
-        for later in messages[last_confirm_idx + 1:]:
-            if later.get("role") != "user":
-                continue
-            text = (later.get("content") or "").casefold()
-            if _REVISION_RE.search(text) and not _CONFIRM_RE.search(text):
-                return False
+    # Rule 7: the proposal must be newer than any customer revision, otherwise
+    # the agent must re-propose before a write can be authorised. This covers
+    # both "confirm then revise" and "revise then confirm" orderings.
+    if last_revision_idx > last_proposal_idx:
+        return False
     return last_confirm_idx > last_proposal_idx
 
 
