@@ -41,6 +41,7 @@ def respond(messages: list, tools: list, policy: str) -> dict:
 | `agent.py` | **MVP / 正式提交物**：提示词层 + 确定性安全护栏 |
 | `test_agent_logic.py` | 离线单元测试（**23 项全过**），纯逻辑、无需联网 |
 | `mock_runner.py` | 离线端到端模拟器（确定性假模型，免 API key） |
+| `mock_scenarios.py` | 离线场景验证：批量改单 + 客户改主意（规则7） |
 | `practice_runner.py` | 真实 LLM 练习 runner（需自备有余额的 key） |
 | `interview_sdk.py` | 模型调用 SDK（`from interview_sdk import chat`） |
 | `practice_policy.md` / `practice_task.json` / `practice_fixture.json` | 练习套件（平台自带，考试时不传） |
@@ -67,6 +68,12 @@ python mock_runner.py
 
 > 本机若未把 Python 加到 PATH，可用已安装的解释器：
 > `C:\Users\22521\.workbuddy-cn-backup-20261024-200105\binaries\python\versions\3.13.12\python.exe`
+
+### 2b. 场景验证：批量改单 / 客户改主意（规则7）
+```bash
+python mock_scenarios.py
+```
+演示：一次计划确认后逐单执行两笔写；客户确认后改主意→旧确认失效、过期写被拦、重新提案再确认。
 
 ### 3. 真实模型练习（需自备有余额的 key）
 ```bash
