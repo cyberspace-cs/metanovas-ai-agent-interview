@@ -41,113 +41,139 @@ PRIVATE_READ_TOOLS = {
     "inspect_asset_family",
 }
 
-# Words that mark an assistant message as a *change proposal* (used to decide
-# whether a later customer confirmation is "fresh"). Deliberately action-oriented
-# and avoiding generic verbs like "update"/"modify"/"switch" so that a neutral
-# batch-execution status line ("Applying the confirmed plan to RS-..") is NOT
-# mistaken for a new proposal (which would otherwise invalidate the confirmation).
-# Matching uses word boundaries so that e.g. "exchange" does not count as a
-# "change" proposal and "yesterday" does not count as a "yes" confirmation.
+# Confirmation state is reconstructed from natural-language turns. These lists
+# are intentionally broad: an overly narrow list makes the guardrail reject a
+# valid confirmation and strands the conversation before any write.
 PROPOSAL_MARKERS = (
-    "propose", "change", "replace", "swap", "cancel",
-    "am changing", "will change",
+    "propose", "proposal", "plan", "change", "replace", "swap", "update",
+    "modify", "cancel", "create", "delete", "remove", "add", "intend",
+    "recommend", "suggest", "action", "no-action",
 )
-# Words that mark a customer message as an explicit confirmation.
+CONFIRM_REQUEST_MARKERS = (
+    "please confirm", "confirm this", "confirm the", "confirm if",
+    "confirm whether", "do you confirm", "could you confirm", "can you confirm",
+    "would you confirm", "please proceed", "shall i", "should i",
+    "would you like", "may i", "go ahead", "approve", "ok to proceed",
+    "okay to proceed", "ready to proceed",
+)
+NEUTRAL_STATUS_MARKERS = (
+    "applying the confirmed", "executing the confirmed", "processing the confirmed",
+    "continuing with the confirmed", "moving on to", "working on",
+)
+REPORT_MARKERS = (
+    "done", "completed", "succeeded", "finished", "summary", "result",
+    "no further action", "all requested",
+)
+GUARDRAIL_MARKERS = (
+    "i can't make this change yet", "i cannot make this change yet",
+    "before i can access private records", "i need to verify",
+    "i need to read", "i haven't read these yet", "i still need:",
+    "does not belong to your verified account", "i didn't catch that",
+)
 CONFIRM_MARKERS = (
-    "confirm", "i confirm", "yes", "proceed", "go ahead", "approve",
-    "approved", "do it", "please proceed", "looks good", "correct",
-    "that's right", "go for it", "make the change",
+    "confirm", "confirmed", "confirmation", "i confirm", "yes", "yes please",
+    "yeah", "yep", "proceed", "go ahead", "approve", "approved", "accept",
+    "accepted", "agree", "agreed", "ok", "okay", "sure", "do it", "do that",
+    "do this", "please do", "please proceed", "looks good", "sounds good",
+    "correct", "that's right", "that works", "works for me", "fine",
+    "that's fine", "that is fine", "go for it", "make the change", "make it",
+    "make those", "make these", "apply", "execute", "carry on", "continue",
 )
-
-_PROPOSAL_RE = re.compile(
-    r"(?<!\w)(?:" + "|".join(re.escape(m) for m in PROPOSAL_MARKERS) + r")(?!\w)"
-)
-_CONFIRM_RE = re.compile(
-    r"(?<!\w)(?:" + "|".join(re.escape(m) for m in CONFIRM_MARKERS) + r")(?!\w)"
-)
-
-# A customer revision AFTER a confirmation invalidates it (rule 7: latest
-# instruction is authoritative; stale planned actions must be discarded).
-# Deliberately strong markers so a neutral "continue" is not mistaken for a
-# revision, and a message that is itself a confirmation ("actually, go ahead")
-# is still treated as a confirmation.
 REVISION_MARKERS = (
     "instead", "actually", "rather", "on second thought", "never mind",
     "nevermind", "change of plan", "switch to", "different option",
-    "cancel that", "let's change", "lets change", "scratch that",
+    "cancel that", "let's change", "lets change", "scratch that", "wait",
+    "stop", "don't", "do not", "dont", "hold on", "cancel", "skip", "leave",
+    "remove", "exclude", "also", "add", "include",
 )
-_REVISION_RE = re.compile(
-    r"(?<!\w)(?:" + "|".join(re.escape(m) for m in REVISION_MARKERS) + r")(?!\w)"
+NEGATION_MARKERS = (
+    "do not", "don't", "dont", "not yet", "no,", "no.", "wait", "stop",
+    "hold on", "cancel",
 )
 
 
-def _build_system_prompt(policy: str) -> dict:
-    rules = (
-        "You are a precise transactional customer-support agent. Follow the "
-        "supplied policy EXACTLY. The conversation is stateless: you receive "
-        "the complete transcript on every turn, so reconstruct the current "
-        "intent, what is already done, what is pending, and whether you have a "
-        "fresh confirmation purely from the messages.\n\n"
-        "RUNTIME SCHEMAS: the `tools` list and `policy` are authoritative for "
-        "THIS task. Derive the real tool names, required arguments, the target "
-        "record id field, and the mutation tool from them. Do not assume the "
-        "practice task's field names apply here; adapt to the schema you are "
-        "given.\n\n"
-        "HARD CONSTRAINTS (violating any fails the task):\n"
-        "1. Authenticate the customer with locate_member (full name + six-digit "
-        "code) BEFORE any private read (read_member_profile, read_reservation, "
-        "inspect_asset_family). Never guess internal identifiers, and never read "
-        "or change records that do not belong to the verified member.\n"
-        "2. Call AT MOST ONE tool per turn. Never call a tool and also return "
-        "customer text in the same turn.\n"
-        "3. For any write/change: first state the exact target, the current "
-        "option, the proposed option, the exact fee difference (use "
-        "compute_amount to calculate it), and the funding source. Then ask for "
-        "an explicit confirmation using the words 'confirm' or 'proceed'. Only "
-        "AFTER the customer explicitly confirms that exact change may you call "
-        "the write tool. One confirmation authorises the change(s) it covers.\n"
-        "4. Never invent records, options, fees, balances, or policy facts. "
-        "Use tool results as the only source of truth.\n"
-        "5. Apply EVERY constraint in the customer request to the current tool "
-        "evidence before selecting an option. For min/max constraints compare "
-        "ALL qualifying options and pick the true optimum. Never substitute an "
-        "option from a different equipment family.\n"
-        "6. Refuse requests outside policy and explain with verified facts "
-        "(e.g. a reservation not in 'awaiting_collection' cannot be changed; a "
-        "desired option that is unavailable or in another family cannot be "
-        "selected). Escalate only when policy requires.\n"
-        "7. The customer's latest instruction is authoritative. If they revise "
-        "a request, DISCARD stale planned actions immediately and recalculate "
-        "from current records. Do NOT complete an obsolete plan, even if it was "
-        "previously confirmed.\n"
-        "8. For batch requests: inspect ALL relevant records first, then present "
-        "an order-by-order plan naming each record, its verified status, and "
-        "the intended action or explicit no-action decision. Get one "
-        "confirmation on that plan. Then complete every eligible subtask (one "
-        "write per turn) and report what was actually done. Do not stop after "
-        "only one subtask.\n\n"
-        "WORKFLOW for a change request:\n"
-        "a) locate_member -> read_member_profile -> read_reservation -> "
-        "inspect_asset_family (gather evidence, one tool per turn).\n"
-        "b) Evaluate every constraint against the evidence. If nothing qualifies, "
-        "say so with verified facts.\n"
-        "c) If a change is warranted: state target/current/proposed/fee "
-        "difference/funding source, then ask 'Please confirm that you want me to "
-        "proceed with this exact change.'\n"
-        "d) After explicit confirmation, call the write tool exactly once.\n"
-        "e) When executing a confirmed BATCH plan, call the write tool for each "
-        "order one turn at a time. Use only neutral status lines such as "
-        "'Applying the confirmed plan to <id>.' -- do NOT introduce a new change "
-        "proposal during execution.\n"
-        "f) Report the verified outcome: selected option, exact fee impact, "
-        "funding source, and whether each change succeeded.\n\n"
-        "RESPONSE CONTRACT (return exactly one shape, nothing else):\n"
-        "  To speak:        {\"content\": \"your message\"}\n"
-        "  To call a tool:  {\"tool_call\": {\"name\": \"tool_name\", \"arguments\": {…}}}\n"
+def _marker_regex(markers):
+    return re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(m) for m in markers) + r")(?!\w)"
     )
+
+
+_PROPOSAL_RE = _marker_regex(PROPOSAL_MARKERS)
+_CONFIRM_REQUEST_RE = _marker_regex(CONFIRM_REQUEST_MARKERS)
+_NEUTRAL_RE = _marker_regex(NEUTRAL_STATUS_MARKERS)
+_REPORT_RE = _marker_regex(REPORT_MARKERS)
+_GUARDRAIL_RE = _marker_regex(GUARDRAIL_MARKERS)
+_CONFIRM_RE = _marker_regex(CONFIRM_MARKERS)
+_REVISION_RE = _marker_regex(REVISION_MARKERS)
+_NEGATION_RE = _marker_regex(NEGATION_MARKERS)
+
+
+def _is_proposal_text(text: str) -> bool:
+    """Distinguish a proposed plan from execution status and final reports."""
+    if _GUARDRAIL_RE.search(text):
+        return False
+    if _CONFIRM_REQUEST_RE.search(text):
+        return True
+    if _NEUTRAL_RE.search(text) or _REPORT_RE.search(text):
+        return False
+    return bool(_PROPOSAL_RE.search(text))
+
+
+def _build_system_prompt(policy: str, messages=None, tools=None) -> dict:
+    rules = (
+        "You are a precise transactional customer-support agent. Follow the supplied "
+        "policy EXACTLY. The tools and policy supplied at runtime are authoritative: "
+        "derive tool names, required arguments and record fields from them rather than "
+        "assuming the practice schema.\n\n"
+        "STATELESS TURN LOOP — reconstruct this on EVERY turn:\n"
+        "1) latest customer intent, 2) evidence already gathered, 3) writes already "
+        "completed, 4) writes still pending, 5) whether a fresh confirmation covers the "
+        "current plan. Do not restart the workflow or repeat a successful read/write just "
+        "because the transcript is replayed. Continue from the first unfinished subtask.\n\n"
+        "HARD RULES:\n"
+        "1. Verify identity with the runtime identity/lookup tool BEFORE private reads. "
+        "Read or change only records belonging to the verified customer. Never invent ids.\n"
+        "2. AT MOST ONE tool call per turn; never return customer text and a tool call "
+        "together. Use exact schema arguments and no invented fields.\n"
+        "3. Before EACH write, state its exact target, current value, proposed value, "
+        "exact fee impact and funding source, then obtain a fresh explicit confirmation. "
+        "A confirmation covers only the explicitly described action(s). After confirmation, "
+        "execute promptly; do not redundantly re-read or ask again.\n"
+        "4. Tool results are the only source of truth. Never claim a write succeeded unless "
+        "its tool result proves success. On a tool error, report/adapt using the error and "
+        "continue other eligible subtasks instead of stopping the whole batch.\n"
+        "5. Apply ALL constraints JOINTLY to current evidence (availability, compatibility, "
+        "family, specifications, fee, budget/funding). Compare every qualifying candidate "
+        "for min/max and choose the true optimum. Never satisfy one constraint by violating "
+        "another, and never substitute another family.\n"
+        "6. Refuse ineligible actions with verified facts. No-action is a valid decision for "
+        "an ineligible record and needs neither a write nor a confirmation.\n"
+        "7. The latest customer instruction outranks every earlier plan. On revision, STOP "
+        "all unexecuted stale actions. Keep already-completed writes as facts (never repeat "
+        "or silently undo them), recompute affected pending items from current evidence, "
+        "present the revised remaining plan and get fresh confirmation for changed actions.\n"
+        "8. For batch/conditional work, inspect ALL relevant records BEFORE the first write "
+        "and present an order-by-order action matrix: record id, verified status, conditions "
+        "checked, action or explicit no-action, selected variant, fee/funding. One explicit "
+        "plan confirmation may cover all listed writes. Then execute EVERY eligible pending "
+        "subtask one per turn; never stop after only the first.\n\n"
+        "EXECUTION PRIORITIES:\n"
+        "- If identity or required evidence is missing, call the next necessary read tool.\n"
+        "- If a changed plan needs confirmation, present it and ask clearly.\n"
+        "- If the current plan is confirmed, call the next pending write immediately.\n"
+        "- If every subtask is resolved, return the final report; do not make more calls.\n\n"
+        "FINAL CUSTOMER OUTPUT must reconcile EVERY requested record: requested condition, "
+        "verified status/evidence, action or reason for no-action, selected option, exact fee "
+        "impact and funding, and actual write outcome (success or error). Clearly distinguish "
+        "completed, skipped and failed items.\n\n"
+        "RESPONSE CONTRACT (exactly one shape):\n"
+        "  Speak:       {\"content\": \"your message\"}\n"
+        "  Call a tool: {\"tool_call\": {\"name\": \"tool_name\", \"arguments\": {...}}}\n"
+    )
+    digest = _state_digest(messages or [])
     return {
         "role": "system",
-        "content": rules + "\n\n# Policy (authoritative)\n" + policy,
+        "content": rules + "\n\n" + digest + "\n\n# Policy (authoritative)\n" + policy,
     }
 
 
@@ -190,19 +216,48 @@ def _is_private_read(name: str) -> bool:
 
 
 def _is_authenticated(messages) -> bool:
-    """True if a successful locate_member result appears in the transcript."""
+    """True after a successful identity/lookup tool result.
+
+    Do not rely on one fixture's `MB-...` string shape: formal records may nest
+    the member id or return a verification object. Tool-call ids let us identify
+    the lookup tool even when its result contains no member id at all.
+    """
+    call_names = {}
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            fn = tc.get("function", tc)
+            call_names[tc.get("id")] = (fn.get("name") or "").lower()
+
+    def failed(data, raw):
+        text = raw.casefold() if isinstance(raw, str) else ""
+        if any(word in text for word in ("not found", "error", "failed", "invalid")):
+            return True
+        if isinstance(data, dict):
+            return bool(data.get("error")) or data.get("success") is False or data.get("verified") is False
+        return data in (None, "", False)
+
     for m in messages:
         if m.get("role") != "tool":
             continue
         raw = m.get("content", "")
-        try:
-            data = json.loads(raw) if isinstance(raw, str) else raw
-        except (json.JSONDecodeError, TypeError):
+        data = _parse_tool(m)
+        name = call_names.get(m.get("tool_call_id"), m.get("name", "")).lower()
+        if name.startswith(("locate", "verify", "authenticate")) and not failed(data, raw):
+            return True
+        if failed(data, raw):
             continue
         if isinstance(data, str) and data.startswith("MB-"):
             return True
-        if isinstance(data, dict) and data.get("member_id"):
-            return True
+        if isinstance(data, dict):
+            if any(data.get(k) for k in ("member_id", "customer_id", "account_id")):
+                return True
+            member = data.get("member") or data.get("customer")
+            if isinstance(member, dict) and any(member.values()):
+                return True
+            if data.get("verified") is True or data.get("authenticated") is True:
+                return True
     return False
 
 
@@ -219,10 +274,10 @@ def _confirmation_present(messages) -> bool:
         role = m.get("role")
         text = (m.get("content") or "").casefold()
         if role == "assistant":
-            if _PROPOSAL_RE.search(text):
+            if _is_proposal_text(text):
                 last_proposal_idx = i
         elif role == "user":
-            is_confirm = bool(_CONFIRM_RE.search(text))
+            is_confirm = bool(_CONFIRM_RE.search(text)) and not _NEGATION_RE.search(text)
             is_revision = bool(_REVISION_RE.search(text)) and not is_confirm
             if is_confirm:
                 last_confirm_idx = i
@@ -325,11 +380,106 @@ def _id_observed(messages, value) -> bool:
     return False
 
 
+def _state_digest(messages) -> str:
+    """Compact, deterministic state summary injected on every model call.
+
+    The model sees the full transcript too, but this explicit ledger prevents it
+    from forgetting completed reads/writes or restarting after a confirmation.
+    """
+    calls = {}
+    for m in messages:
+        if m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            fn = tc.get("function", tc)
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            calls[tc.get("id")] = (fn.get("name") or "tool", args)
+
+    history = []
+    for m in messages:
+        if m.get("role") != "tool":
+            continue
+        name, args = calls.get(m.get("tool_call_id"), (m.get("name") or "tool", {}))
+        data = _parse_tool(m)
+        error = data.get("error") if isinstance(data, dict) else None
+        history.append((name, args, error))
+
+    latest_user = next(
+        ((m.get("content") or "") for m in reversed(messages) if m.get("role") == "user"),
+        "",
+    )
+    lines = [
+        "# Reconstructed state (derived only from the transcript)",
+        f"- Authenticated: {'yes' if _is_authenticated(messages) else 'no'}",
+        f"- Fresh confirmation for the latest proposal: {'yes' if _confirmation_present(messages) else 'no'}",
+        f"- Latest customer instruction: {latest_user[:900]}",
+        "- Completed tool calls (do not repeat unless revalidation is required):",
+    ]
+    if not history:
+        lines.append("  * none yet")
+    for name, args, error in history[-24:]:
+        try:
+            arg_text = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            arg_text = str(args)
+        outcome = f"ERROR: {error}" if error else "ok"
+        lines.append(f"  * {name}({arg_text[:220]}) -> {outcome}")
+    lines.append(
+        "- Use this ledger to continue the first unfinished eligible subtask; "
+        "completed writes must not be repeated."
+    )
+    return "\n".join(lines)
+
+
+def _normalise_model_result(result):
+    """Unwrap a response contract accidentally encoded as JSON *text*.
+
+    Some chat models answer with content='{"content": "..."}' or even a JSON
+    tool-call string instead of returning the structured shape. Passing that
+    through produces unreadable customer output and loses the intended action.
+    """
+    if not isinstance(result, dict):
+        return result
+    content = result.get("content")
+    if result.get("tool_call") or not isinstance(content, str):
+        return result
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return result
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        return result
+    if not isinstance(decoded, dict):
+        return result
+    if "name" in decoded and "arguments" in decoded and "tool_call" not in decoded:
+        decoded = {"tool_call": {"name": decoded.get("name"),
+                                 "arguments": decoded.get("arguments") or {}}}
+    if "content" in decoded or "tool_call" in decoded:
+        if result.get("_reasoning_content"):
+            decoded["_reasoning_content"] = result["_reasoning_content"]
+        return decoded
+    return result
+
+
 def _enforce(result: dict, messages: list, tools: list) -> dict:
     """Apply the submission contract and policy guardrails to a raw model answer."""
     if not isinstance(result, dict):
         return {"content": "I didn't catch that. Could you restate your request?"}
 
+    result = _normalise_model_result(result)
     tool_call = result.get("tool_call")
     content = result.get("content")
 
@@ -359,7 +509,7 @@ def _enforce(result: dict, messages: list, tools: list) -> dict:
             # contains a reservation-like record (the practice schema). On a
             # different formal schema these are skipped; the tool + policy then
             # enforce record state, so we never false-block another domain.
-            if isinstance(reservation, dict):
+            if isinstance(reservation, dict) and (name in WRITE_TOOLS or "old_asset_id" in arguments):
                 status = reservation.get("status")
                 if status is not None and status != "awaiting_collection":
                     return {
@@ -477,6 +627,6 @@ def respond(messages: list[dict], tools: list[dict], policy: str) -> dict:
     The evaluator calls this function repeatedly with the complete transcript.
     Keep all durable state in the transcript, never in module globals.
     """
-    system = _build_system_prompt(policy)
+    system = _build_system_prompt(policy, messages, tools)
     result = chat([system, *messages], tools=tools, temperature=0)
     return _enforce(result, messages, tools)

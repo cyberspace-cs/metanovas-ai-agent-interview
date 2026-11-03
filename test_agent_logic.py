@@ -252,4 +252,34 @@ t("batch second write allowed after first",
   r.get("tool_call", {}).get("name") == "change_reserved_asset")
 
 
+# --- output normalisation + realistic confirmation/auth variants ----------
+r = agent._enforce({"content": '{"content": "Hello Mara"}'}, [], [])
+t("double-encoded content is unwrapped", r == {"content": "Hello Mara"})
+r = agent._enforce({"content": '```json\n{"content": "Hello again"}\n```'}, [], [])
+t("code-fenced contract content is unwrapped", r == {"content": "Hello again"})
+t("natural affirmative counts as confirmation",
+  agent._confirmation_present([
+      {"role": "assistant", "content": "Here is my plan: replace A with B. Shall I proceed?"},
+      {"role": "user", "content": "That works for me, please do."},
+  ]) is True)
+t("neutral batch execution does not invalidate confirmation",
+  agent._confirmation_present([
+      {"role": "assistant", "content": "I propose to replace A with B. Please confirm."},
+      {"role": "user", "content": "Sure, go ahead."},
+      {"role": "assistant", "content": "Applying the confirmed plan to RS-1."},
+  ]) is True)
+nested_auth = [
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "locate_member", "arguments": "{}"}}]},
+    {"role": "tool", "tool_call_id": "c1", "content": json.dumps({"member": {"id": "MB-1"}})},
+]
+t("nested member verification authenticates", agent._is_authenticated(nested_auth) is True)
+failed_auth = [
+    {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c2", "type": "function", "function": {"name": "locate_member", "arguments": "{}"}}]},
+    {"role": "tool", "tool_call_id": "c2", "content": json.dumps({"error": "Member not found"})},
+]
+t("failed lookup does not authenticate", agent._is_authenticated(failed_auth) is False)
+
+
 print("\nRESULT:", "ALL PASS" if not FAILED else "SOME FAILED")
