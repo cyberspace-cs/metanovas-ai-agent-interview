@@ -1,0 +1,97 @@
+{
+  "members": {
+    "MB-DF323084F4": {
+      "member_id": "MB-DF323084F4",
+      "full_name": "Mara Voss",
+      "member_code": "588701",
+      "credits": {
+        "CR-AFCE80FF": {
+          "credit_id": "CR-AFCE80FF",
+          "type": "project_credit",
+          "balance": 75.0
+        }
+      },
+      "reservations": [
+        "RS-BC348019D"
+      ]
+    }
+  },
+  "reservations": {
+    "RS-BC348019D": {
+      "reservation_id": "RS-BC348019D",
+      "member_id": "MB-DF323084F4",
+      "status": "awaiting_collection",
+      "assets": [
+        {
+          "family_id": "AF-DFD6C6D1",
+          "asset_id": "EQ-C2B2059D",
+          "name": "Portable Field Recorder",
+          "fee": 39.5,
+          "specifications": {
+            "battery_hours": 8,
+            "balanced_xlr": false,
+            "weight_grams": 420
+          }
+        }
+      ]
+    }
+  },
+  "asset_families": {
+    "AF-DFD6C6D1": {
+      "family_id": "AF-DFD6C6D1",
+      "name": "Portable Field Recorder",
+      "options": {
+        "EQ-C2B2059D": {
+          "asset_id": "EQ-C2B2059D",
+          "fee": 39.5,
+          "available": true,
+          "specifications": {
+            "battery_hours": 8,
+            "balanced_xlr": false,
+            "weight_grams": 420
+          }
+        },
+        "EQ-5C143A54": {
+          "asset_id": "EQ-5C143A54",
+          "fee": 53.5,
+          "available": true,
+          "specifications": {
+            "battery_hours": 12,
+            "balanced_xlr": true,
+            "weight_grams": 365
+          }
+        },
+        "EQ-779E9DD5": {
+          "asset_id": "EQ-779E9DD5",
+          "fee": 49.75,
+          "available": true,
+          "specifications": {
+            "battery_hours": 19,
+            "balanced_xlr": true,
+            "weight_grams": 510
+          }
+        },
+        "EQ-3FCB35D6": {
+          "asset_id": "EQ-3FCB35D6",
+          "fee": 43.5,
+          "available": false,
+          "specifications": {
+            "battery_hours": 14,
+            "balanced_xlr": true,
+            "weight_grams": 330
+          }
+        },
+        "EQ-5B0D6443": {
+          "asset_id": "EQ-5B0D6443",
+          "fee": 44.5,
+          "available": true,
+          "specifications": {
+            "battery_hours": 10,
+            "balanced_xlr": true,
+            "weight_grams": 340
+          }
+        }
+      }
+    }
+  }
+}

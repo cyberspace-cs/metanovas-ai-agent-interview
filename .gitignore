@@ -1,0 +1,11 @@
+# Project data (IDE/agent workspace) — not part of the deliverable
+.codebuddy/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets (never commit). Tokens are passed via env vars only.
+.env
+*.env

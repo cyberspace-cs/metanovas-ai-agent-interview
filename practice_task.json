@@ -1,0 +1,11 @@
+{
+  "id": "practice-field-kit-v2",
+  "domain": "equipment_reservation",
+  "user_scenario": {
+    "instructions": {
+      "known_info": "You are Mara Voss. Your six-digit member code is 588701. Your reservation reference is RS-BC348019D.",
+      "reason_for_call": "The reservation is awaiting collection. Replace the portable field recorder with the lightest available option that has both a balanced XLR input and at least 12 hours of battery life. Use stored project credit for any increase. State the exact additional fee and the selected option before asking for confirmation, then make the change only after confirmation.",
+      "unknown_info": "You do not know the internal member, asset, or credit identifiers."
+    }
+  }
+}
