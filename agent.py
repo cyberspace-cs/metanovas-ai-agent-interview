@@ -144,6 +144,16 @@ def _build_system_prompt(policy: str, messages=None, tools=None) -> dict:
         "completed, 4) writes still pending, 5) whether a fresh confirmation covers the "
         "current plan. Do not restart the workflow or repeat a successful read/write just "
         "because the transcript is replayed. Continue from the first unfinished subtask.\n\n"
+        "INTENT LEDGER — the customer's request is a SET of sub-intents, not one goal. "
+        "Decompose it into numbered items, each with: target record, trigger condition, "
+        "desired action, every constraint, funding source, and the exact no-action "
+        "condition. Keep similar-looking but distinct goals separate (changing an "
+        "order's ship-to address is NOT changing the profile address). After EVERY "
+        "customer message rebuild the ledger: name which items are new, changed or "
+        "withdrawn, restate the remaining items, and explicitly say which completed "
+        "writes stay as facts. Never silently drop a sub-intent. Prefix each plan and "
+        "report with a short 'Understanding' list mapping 1:1 to the customer's "
+        "requests, including items resolved as no-action.\n\n"
         "HARD RULES:\n"
         "1. Verify identity with the runtime identity/lookup tool BEFORE private reads. "
         "Read or change only records belonging to the verified customer. Never invent ids.\n"
@@ -159,7 +169,10 @@ def _build_system_prompt(policy: str, messages=None, tools=None) -> dict:
         "5. Apply ALL constraints JOINTLY to current evidence (availability, compatibility, "
         "family, specifications, fee, budget/funding). Compare every qualifying candidate "
         "for min/max and choose the true optimum. Never satisfy one constraint by violating "
-        "another, and never substitute another family.\n"
+        "another, and never substitute another family. For each candidate/record list every "
+        "constraint with its pass/fail and the exact value from the tool result, and state "
+        "why each rejected candidate fails. Use the provided computation tool for any price "
+        "difference or comparison instead of mental arithmetic.\n"
         "6. Refuse ineligible actions with verified facts. No-action is a valid decision for "
         "an ineligible record and needs neither a write nor a confirmation.\n"
         "7. The latest customer instruction outranks every earlier plan. On revision, STOP "
@@ -188,10 +201,16 @@ def _build_system_prompt(policy: str, messages=None, tools=None) -> dict:
         "writes, keep completed ones as done, recompute only affected records, "
         "present the revised remaining plan, obtain fresh confirmation for changed "
         "actions, then finish every remaining subtask.\n\n"
-        "FINAL CUSTOMER OUTPUT must reconcile EVERY requested record: requested condition, "
-        "verified status/evidence, action or reason for no-action, selected option, exact fee "
-        "impact and funding, and actual write outcome (success or error). Clearly distinguish "
-        "completed, skipped and failed items.\n\n"
+        "PER-RECORD WORKSHEET (before the first write): for EVERY requested record give "
+        "id, verified status, each condition checked with its value, the action OR an "
+        "explicit no-action with the failing condition, selected option, exact fee and "
+        "funding. A justified no-action counts as a resolved item, not an omission.\n\n"
+        "FINAL CUSTOMER OUTPUT must be a numbered list reconciling EVERY requested "
+        "record and EVERY sub-intent: the requested condition, verified status/evidence, "
+        "the action taken or the reason for no-action, the selected option, exact fee "
+        "impact and funding, and the actual write outcome (success or error). Clearly "
+        "label completed, skipped and failed items. Do not emit raw JSON or tool "
+        "payloads to the customer.\n\n"
         "RESPONSE CONTRACT (exactly one shape):\n"
         "  Speak:       {\"content\": \"your message\"}\n"
         "  Call a tool: {\"tool_call\": {\"name\": \"tool_name\", \"arguments\": {...}}}\n"
@@ -199,7 +218,10 @@ def _build_system_prompt(policy: str, messages=None, tools=None) -> dict:
     digest = _state_digest(messages or [])
     return {
         "role": "system",
-        "content": rules + "\n\n" + digest + "\n\n# Policy (authoritative)\n" + policy,
+        "content": (
+            rules + "\n\n" + digest + "\n\n" + _tool_brief(tools)
+            + "\n\n# Policy (authoritative)\n" + policy
+        ),
     }
 
 
@@ -224,6 +246,25 @@ def _tool_params(tools) -> dict:
         if name:
             out[name] = fn.get("parameters", {}) or {}
     return out
+
+
+def _tool_brief(tools) -> str:
+    """Runtime schema digest so the model copies real tool names and fields."""
+    lines = ["# Runtime tools (use these exact names and argument fields)"]
+    for t in (tools or []):
+        fn = t.get("function", t)
+        name = fn.get("name")
+        if not name:
+            continue
+        params = fn.get("parameters", {}) or {}
+        fields = list((params.get("properties") or {}).keys())
+        required = list(params.get("required", []) or [])
+        lines.append(f"- {name}: required={required}; fields={fields}")
+    lines.append(
+        "Never invent a tool name or argument field; fill values only from tool "
+        "results or the customer's verified message, and check every required field."
+    )
+    return "\n".join(lines)
 
 
 _WRITE_PREFIXES = (
@@ -306,6 +347,18 @@ def _last_proposal_index(messages) -> int:
     return last
 
 
+_MIXED_REVISION_RE = re.compile(
+    r"(?:\bbut\b|\bhowever\b|\binstead\b|\brather\b|\bon second thought\b|"
+    r"\bchange of plan\b|\bscratch that\b|\balso\b|\badditionally\b|\bplus\b|"
+    r"\bone more\b|\bin addition\b|\bexcept\b|\bas well\b)"
+    r"[^.?!]{0,120}?"
+    r"\b(?:change|replace|swap|update|modify|remove|add|set|switch|use|"
+    r"keep|leave|skip|drop|exclude|include|choose|select|pick|revert|"
+    r"want|need|instead|different|rs-|reservation|order|asset)\b",
+    re.I,
+)
+
+
 def _classify_user_reply(text: str) -> str:
     """Classify a customer reply following a proposal: confirm | revision | other.
 
@@ -317,6 +370,11 @@ def _classify_user_reply(text: str) -> str:
     """
     if _QUESTION_RE.search(text):
         return "other"
+    # "Yes, confirmed, but also switch RS-B to X" is a revision, not consent.
+    # Detect the added instruction BEFORE confirm markers so the newest intent
+    # wins and the stale plan is replanned instead of executed.
+    if _MIXED_REVISION_RE.search(text):
+        return "revision"
     if _CONFIRM_RE.search(text):
         return "confirm"
     if _REVISION_RE.search(text) or _ACTION_RE.search(text):
@@ -481,13 +539,23 @@ def _state_digest(messages) -> str:
         ((m.get("content") or "") for m in reversed(messages) if m.get("role") == "user"),
         "",
     )
+    first_user = next(
+        ((m.get("content") or "") for m in messages if m.get("role") == "user"),
+        "",
+    )
     lines = [
         "# Reconstructed state (derived only from the transcript)",
         f"- Authenticated: {'yes' if _is_authenticated(messages) else 'no'}",
         f"- Fresh confirmation for the latest proposal: {'yes' if _confirmation_present(messages) else 'no'}",
-        f"- Latest customer instruction: {latest_user[:900]}",
-        "- Completed tool calls (do not repeat unless revalidation is required):",
     ]
+    if first_user and first_user != latest_user:
+        lines.append(f"- Original customer request: {first_user[:900]}")
+    lines.append(f"- Latest customer instruction: {latest_user[:900]}")
+    lines.append("- Completed tool calls (do not repeat unless revalidation is required):")
+    lines.append(
+        "- Every sub-intent in the original request must end as a write, an explicit "
+        "no-action with a reason, or be listed as still pending."
+    )
     if _stale_after_revision(messages):
         lines.append(
             "- NOTE: the latest customer instruction revised the previous plan; "
