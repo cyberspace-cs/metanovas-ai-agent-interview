@@ -154,6 +154,19 @@ def _build_system_prompt(policy: str, messages=None, tools=None) -> dict:
         "writes stay as facts. Never silently drop a sub-intent. Prefix each plan and "
         "report with a short 'Understanding' list mapping 1:1 to the customer's "
         "requests, including items resolved as no-action.\n\n"
+        "INTENT STATE — confidence and completeness are different. For EVERY "
+        "sub-intent keep a slot ledger: target, required slots, observed value, "
+        "and source (customer message or tool result). A well-understood intent "
+        "with missing required slots is NOT executable. Resolve slots in this "
+        "order: current message -> already gathered tool results -> other runtime "
+        "tools -> the customer. Never invent a value and never re-ask for "
+        "information already in the transcript. If a required slot is truly "
+        "unobtainable, ask ONCE, listing all missing slots together, and explain "
+        "why. Treat each new customer message as an event that may add, revise or "
+        "withdraw sub-intents: restate the CURRENT INTENT (active constraints, "
+        "completed writes, remaining sub-intents) before the next action. "
+        "Conversation history is evidence; the current-intent recap is what "
+        "applies now.\n\n"
         "HARD RULES:\n"
         "1. Verify identity with the runtime identity/lookup tool BEFORE private reads. "
         "Read or change only records belonging to the verified customer. Never invent ids.\n"
@@ -574,6 +587,13 @@ def _state_digest(messages) -> str:
         "- Use this ledger to continue the first unfinished eligible subtask; "
         "completed writes must not be repeated."
     )
+    lines.append(
+        "- CURRENT INTENT recap: authoritative but REVISABLE. A newer customer "
+        "message can add, revise or withdraw sub-intents; stale lines earlier in "
+        "the transcript must never override it. Before any plan or write, restate "
+        "the active constraints, the completed writes kept as facts, and the "
+        "remaining sub-intents."
+    )
     return "\n".join(lines)
 
 
@@ -639,10 +659,11 @@ def _enforce(result: dict, messages: list, tools: list) -> dict:
         if not name:
             return {"content": "I need a valid action. Could you clarify your request?"}
 
-        # Exact arguments: when the schema forbids extra properties, drop fields
-        # the model invented so the call matches the declared contract.
+        # Exact arguments: emulate strict-mode function calling. Unless the
+        # schema explicitly allows extra properties, drop any field the model
+        # invented so the call matches the declared contract exactly.
         params = _tool_params(tools).get(name, {})
-        if params.get("additionalProperties") is False:
+        if params.get("additionalProperties") is not True:
             allowed = set((params.get("properties") or {}).keys())
             if allowed:
                 arguments = {k: v for k, v in arguments.items() if k in allowed}
