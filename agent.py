@@ -69,7 +69,8 @@ GUARDRAIL_MARKERS = (
     "before i can access private records", "i need to verify",
     "i need to read", "i need to re-check", "i haven't read these yet",
     "i still need:", "does not belong to your verified account",
-    "i didn't catch that",
+    "i didn't catch that", "updated understanding of your request",
+    "superseded: all unexecuted",
 )
 CONFIRM_MARKERS = (
     "confirm", "confirmed", "confirmation", "i confirm", "yes", "yes please",
@@ -763,11 +764,23 @@ def _enforce(result: dict, messages: list, tools: list) -> dict:
             # --- Guardrail: fresh explicit confirmation before any write ---
             if not _confirmation_present(messages):
                 if _stale_after_revision(messages):
+                    latest = next(
+                        ((m.get("content") or "") for m in reversed(messages)
+                         if m.get("role") == "user"),
+                        "",
+                    )
                     return {
                         "content": (
-                            "Your latest instruction changes the plan, so I need to "
-                            "re-check the affected records and present an updated plan "
-                            "for your confirmation before making any change."
+                            "Updated understanding of your request:\n"
+                            f"- Latest instruction (now authoritative): {latest[:600]}\n"
+                            "- Superseded: all unexecuted actions from the earlier plan "
+                            "are withdrawn and will not be performed.\n"
+                            "- Kept as facts: writes already completed are not repeated "
+                            "and are not silently undone.\n"
+                            "- Remaining intent: I will re-check the affected records, "
+                            "rebuild an order-by-order plan that lists EVERY record with "
+                            "its exact action or no-action branch and the failed condition, "
+                            "then ask for one fresh confirmation before any further write."
                         )
                     }
                 return {
